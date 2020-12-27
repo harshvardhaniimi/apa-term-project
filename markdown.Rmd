@@ -1,0 +1,455 @@
+---
+title: "Predicting House Prices in New Delhi"
+author: "Group Number 10 (Aditya Badonia, Harshvardhan, Oshin Singal, P Suranjana)"
+date: "`r Sys.Date()`"
+output: openintro::lab_report
+---
+
+# Introduction
+
+Buying and selling a real estate is a very complicated issue. Apart from regulatory and legal issues, an economic issue of pricing is at its core. There is no concrete price discovery mechanism in existence and usually first person negotiations decide the price. This project is an attempt to predict price of a house based on its details such as number of bedrooms, area, etc.
+
+## Goals and Methodologies
+
+The aim of this project is to predict prices of house. We compare four methodologies: multilinear regression, splines, classification and regression trees and neural networks.
+
+## Data Source
+
+This dataset was downloaded from Kaggle (<https://www.kaggle.com/neelkamal692/delhi-house-price-prediction>.)). The data was scrapped from web pages of Magic Bricks, a popular platform for buying and selling real estate.
+
+# Data Cleaning and Exploration
+
+## Missing Values
+
+```{r}
+library(tidyverse)
+
+dat <- read.csv("MagicBricks.csv", header = TRUE)
+str(dat)
+
+# Missing values?
+sum(is.na(dat))
+
+# Let us fill all missing values with mode of that variable
+dat_Mode<-function(x){
+  return(names(which.max(table(x))))
+}
+
+dat[is.na(dat$Parking),]$Parking = dat_Mode(dat$Parking)
+dat[is.na(dat$Bathroom),]$Bathroom = dat_Mode(dat$Bathroom)
+dat[dat$Furnishing == "",]$Furnishing = dat_Mode(dat$Furnishing)
+dat[dat$Type == "",]$Type = dat_Mode(dat$Type)
+
+# saving this clean dataset for future use
+write.csv(dat, file = "DelhiHousingClean.csv", row.names = F)
+```
+
+## Data Visualisation
+
+```{r}
+rm(list = ls())
+# loading data
+data = read.csv("DelhiHousingClean.csv", head = T, stringsAsFactors = T)
+head(data)
+str(data)
+```
+
+Most variables are categorical in nature; only area and price are continious. Further, 'Locality' apparently has 365 levels. This might not be entirely accurate many addresses are repeated. For example, "Rohini Sector 24" and "Rohini Sector 24 carpet area 650 sqft status..." are in the same locality. But because of poor web scrapping, errors have popped up.
+
+While recognising that there is need for cleaning this variable, we will skip that part for the paucity of time.
+
+So, assuming that each entry is unique, let's explore.
+
+The variable `Per_Sqft` is mostly Price/Area. Therefore, we exclude it to avoid multicollinearity problems.
+
+```{r}
+data = dplyr::select(data, -Per_Sqft, -Locality)
+
+area = data$Area
+bhk = data$BHK
+bath = data$Bathroom
+furnish = data$Furnishing
+park = data$Parking
+price = data$Price
+status = data$Status
+trans = data$Transaction
+type = data$Type
+```
+
+```{r}
+# Area vs Price
+plot(area, price)
+```
+
+Most are concentrated in the lower are limit and lower price limit. So, let's reset the limits.
+
+```{r}
+plot(area, price, xlim = c(0,6000), ylim = c(0,1.5e8))
+```
+
+The general trend is that as area increases, the price increases.
+
+```{r}
+# BHK
+hist(bhk)
+
+# Bathroom
+hist(bath)
+
+# Parking
+hist(park)
+
+# to eliminate outliers as they are skewing the histogram
+trim <- function(x){
+  x[(x > mean(x, na.rm = T)-1.5*IQR(x, na.rm = T)) & (x < mean(x, na.rm = T)+1.5*IQR(x, na.rm = T))]
+}
+hist(trim(park))
+
+# Price
+boxplot(price, log = "y")
+
+# Status
+barplot(table(status))
+
+# Transaction
+barplot(table(trans))
+
+# Type
+barplot(table(type))
+
+# Furnishing
+barplot(table(furnish))
+
+# Price by Furnishing and Transaction - log scaled
+# trans tell us if the house is new or being resold
+boxplot(price~furnish+trans, col = 2:8, drop = T, boxwex = 0.6, log = "y", na.rm = T)
+abline(h = median(price), col = "red", lwd = 3, lty = 2)
+```
+
+# Modelling House Prices
+
+## Multilinear Regression
+
+```{r}
+rm(list = ls())
+library(tidyverse)
+library(modelr)
+
+dat = read.csv("DelhiHousingClean.csv", head = T, stringsAsFactors = T)
+
+#splitting into training and test data
+set.seed(123)
+dat.split <- modelr::resample_partition(dat, c(test = 0.3, train = 0.7))
+
+train <- as_tibble(dat.split$train)
+test <- as_tibble(dat.split$test)
+```
+
+Fitting regression model:
+
+```{r}
+#linear regression
+dat.lm <- lm(Price ~ Area + BHK + Bathroom + Furnishing  + Parking + Status + Transaction + Type, data = train)
+summary(dat.lm)
+
+#removing 'Type' 
+dat.lm2 <- lm(Price ~ Area + BHK + Bathroom + Furnishing  + Parking + Status + Transaction, data = train)
+summary(dat.lm2)
+
+#removing 'Furnishing'
+dat.lm3 <- lm(Price ~ Area + BHK + Bathroom + Parking + Status + Transaction, data = train)
+summary(dat.lm3)
+
+#removing 'BHK'
+dat.lm4 <- lm(Price ~ Area + Bathroom + Parking + Status + Transaction, data = train)
+summary(dat.lm4)
+```
+
+We will select model 2 as it has the highest adjusted $R^2$. Model 2 is able to explain 59.46 per cent of variance. Plotting predicted and true prices to know how effective the model is:
+
+```{r}
+test <- test %>% add_predictions(dat.lm3)
+ggplot(test, aes(test$Price, test$pred)) +
+  geom_point() +
+  geom_abline()
+```
+
+Prediction $R^2$ for model 2 is:
+
+```{r}
+yhat_test = predict(dat.lm2, newdata = test)
+rsq_test_rpart = 1 - mean((yhat_test - test$Price)^2)/var(test$Price)
+rsq_test_rpart
+```
+
+**So, 56.48 per cent of test variance is explained by regression model.**
+
+## Tree-based Models
+
+```{r}
+rm(list = ls())
+
+data = read.csv("DelhiHousingClean.csv", head = T, stringsAsFactors = T)
+data = dplyr::select(data, -Per_Sqft, -Locality)
+
+
+# Splitting data into training and test
+set.seed(12345)
+l = sample(nrow(data), size = 0.7*nrow(data))
+train = data[l,]
+test = data[-l,]
+```
+
+### Fitting CART via `rpart` Package
+
+```{r}
+library(rpart)
+library(ipred)
+
+# Training model using rpart library
+fit0 = rpart(Price~., data = train, method="anova", control=rpart.control(minsplit=30,cp=0.001))
+```
+
+Multiple values of `minsplit` were tried and then 30 was chosen. Complexity parameter tells how much should the R squared increase by at least to consider an iteration. It is for pruning the needless branches.
+
+```{r}
+# yhat_training
+yhat_train = predict(fit0)
+plot(train$Price, yhat_train)
+rsq_train_rpart = 1 - mean((yhat_train - train$Price)^2)/var(train$Price)
+rsq_train_rpart
+```
+
+Clearly there is heteroskedasticity problem as the error is blowing up as price increases and the training R squared is 75%.
+
+```{r}
+# Let's see the testing R-squared
+yhat_test = predict(fit0, newdata = test)
+plot(test$Price, yhat_test)
+rsq_test_rpart = 1 - mean((yhat_test - test$Price)^2)/var(test$Price)
+rsq_test_rpart
+```
+
+**We get that 59.59 per cent of test variance is explained by CART model.**
+
+### Bagging via `ipred` Package
+
+```{r}
+library(ipred)
+fit1 = bagging(Price~., data = train,nbagg=100,control=rpart.control(minsplit=30,cp=0))
+# choosing 100 bootstrap replications. Higher will give better estimates but will make the machine very slow.
+
+yhat_train = predict(fit1)
+plot(train$Price, yhat_train)
+rsq_train_ipred = 1 - mean((yhat_train - train$Price)^2)/var(train$Price)
+rsq_train_ipred
+```
+
+So, our model is able to explain 71.57 per cent of training set variability.
+
+```{r}
+# Testing ipred model
+yhat_test = predict(fit1, newdata = test)
+plot(test$Price, yhat_test)
+rsq_test_ipred = 1 - mean((yhat_test - test$Price)^2)/var(test$Price)
+rsq_test_ipred
+```
+
+**Using bagging approach via `ipred` library is able to predict 62.94 per cent of variability in test dataset.**
+
+### Random Forest
+
+```{r}
+library(randomForest)
+
+fit_rf = randomForest(Price~.,data=train,ntree=500)
+
+# training accuracy
+yhat_train = predict(fit_rf)
+plot(train$Price, yhat_train)
+rsq_train_randfor = 1 - mean((yhat_train - train$Price)^2)/var(train$Price)
+rsq_train_randfor
+
+# Testing ipred model
+yhat_test = predict(fit_rf, newdata = test)
+plot(test$Price, yhat_test)
+rsq_test_randfor = 1 - mean((yhat_test - test$Price)^2)/var(test$Price)
+rsq_test_randfor
+
+```
+
+**Random forest gives the prediction accuracy of 78.70 per cent, highest of all tree-based methods.**
+
+## Splines
+
+```{r}
+rm(list = ls())
+library(splines2)
+library(tidyverse)
+library(ggcorrplot)
+library(splines)
+
+dat = read.csv("DelhiHousingClean.csv", head = T, stringsAsFactors = T)
+
+plot(dat$Price~dat$Area)
+```
+
+As splines only work with continuous variables, we will only use price and area for predictions. Few other variables can be called ordinal at best, but can't be used properly with splines; while others are categorical in nature.
+
+There are very few variables that are more than 10,000 in area and they are possibly outliers. To make out model better, we remove those extreme points. They are making the spline plot look bad, even when they are just 25-30 points out of over 1200 points.
+
+```{r}
+y<-dat$Price[dat$Area<10000]
+x<-dat$Area[dat$Area<10000]
+```
+
+### Choosing Knots Manually
+
+```{r}
+#Spline Regression (choosing knots manually)
+splinemodel <- lm(y~bs(x, knots = c(2000,4000,6000,8000)), data = dat)
+summary(splinemodel)
+```
+
+The adjusted $R^2$ is 77.37 per cent for training data set.
+
+### Smooth Splines
+
+```{r}
+y.spline<-smooth.spline(x,y, df = 10)
+summary(y.spline)
+#str(y.spline)
+length(y.spline$y)
+
+y.fitted = predict(y.spline, x)
+length(y.fitted$y)
+
+plot(x,y); lines(y.spline, col = 'red', lwd = 3)
+```
+
+Let's find SSE and $R^2$ for smooth splines.
+
+```{r}
+diff = y.fitted$y-y
+diffsq = diff^2
+SSE = sum(diffsq)
+SST = sum((y-mean(y))^2)
+SST
+Rsqr.spline2 = 1-(SSE/SST)
+Rsqr.spline2
+```
+
+For smooth splines, the $R^2$ is 77.70 per cent.
+
+## Artificial Neural Networks
+
+```{r}
+rm(list = ls())
+data = read.csv("DelhiHousingClean.csv", head = T, stringsAsFactors = T)
+data = dplyr::select(data, -Per_Sqft, -Locality)
+
+
+#### Splitting data into training and test
+set.seed(12345)
+l = sample(nrow(data), size = 0.7*nrow(data))
+train = data[l,]
+test = data[-l,]
+
+#### Fitting ANN models
+# ---- ANN using nnet R package----------
+library(nnet) # allows only one hidden layer
+
+# Training model
+Y = train$Price
+n = length(Y)
+
+train_price_scaled = (Y-min(Y))/(max(Y)-min(Y))
+set.seed(12345)
+fit2 = nnet(train_price_scaled ~ Area + BHK + Bathroom + Parking, data=train,size=3,
+            trace=F,decay=0.001)
+print(fit2$wts) # parameter estimates
+
+# yhat_training
+yhat_train = fit2$fitted.values
+plot(train_price_scaled, yhat_train)
+rsq_train = 1 - mean((train_price_scaled - yhat_train)^2)/(var(train_price_scaled))
+print(rsq_train)
+```
+
+```{r}
+# Testing model
+Y = test$Price
+n = length(Y)
+
+test_price_scaled = (Y-min(Y))/(max(Y)-min(Y))
+yhat_test = predict(fit2, newdata = test)
+plot(test_price_scaled, yhat_test)
+rsq_test = 1 - sum((test_price_scaled - yhat_test)^2)/(var(test_price_scaled)*(n-1))
+print(rsq_test)
+```
+
+But we see a possibly somewhat significant difference in $R^2$ train vs \$R\^2\$ test. It might help to resample and try.
+
+Apart from that, we can change "size" in our our model to get better R\^2. By trial & error on sizes=1,2,3,4, we find that k=2 hidden nodes works best.
+
+Now let's try fitting using `neuralnet` R package which offers possibility of having \>1 hidden layers.
+
+```{r}
+library(neuralnet)
+
+#--------1 hidden layer - 3 hidden variables--------#
+## Training model
+Y = train$Price
+n = length(Y)
+train_price_scaled = (Y-min(Y))/(max(Y)-min(Y))
+
+fit2 = neuralnet(train_price_scaled ~ Area + BHK + Bathroom + Parking, 
+                 data=train, hidden=c(3,2), threshold = 0.01, linear.output=FALSE)
+#--- network plot ----
+plot(fit2)
+```
+
+```{r}
+# yhat_training
+
+yhat_train = c((fit2$net.result)[[1]])
+plot(train_price_scaled, yhat_train)
+```
+
+There seems to be an error in the package functioning as required. So, drop all operations based on this package and only consider the `nnet` package.
+
+# Conclusion
+
+Our aim was to best predict the house prices in New Delhi. We tried four different models: linear regression, tree-based methods, splines and artificial neural networks. The *goodness-of-fit* measures for each method with test data is listed below.
+
++--------------------------------------+-------------------------------+
+| Method                               | Test / Adjusted $R^2$         |
++======================================+===============================+
+| Linear Regression                    | 56.48 %                       |
++--------------------------------------+-------------------------------+
+| CART via `rpart` Package             | 59.59 %                       |
++--------------------------------------+-------------------------------+
+| Bagging via `ipred` Package          | 62.94%                        |
++--------------------------------------+-------------------------------+
+| Random Forest                        | 78.70 %                       |
++--------------------------------------+-------------------------------+
+| Splines                              | 77.37 %                       |
++--------------------------------------+-------------------------------+
+| Smooth Splines                       | 77.70 %                       |
++--------------------------------------+-------------------------------+
+| Artificial Neural Network            | 62.71 %                       |
++--------------------------------------+-------------------------------+
+
+Based on the accuracy, **random forest model is the best**. However, the limitation of this model is that it has very low interpretability. Linear regression model has lower accuracy in predictions, but has much better interpretability.
+
+Our purpose in this project was to predict the house prices and Random Forest method does it best, with 78.70 % accuracy.
+
+## Individual Contributions
+
+-   Aditya Badonia: Section on splines.
+
+-   Harshvardhan: Section on tree based models, visualisations and document compilation and formatting.
+
+-   Oshin Singal: Section on multilinear regression and data cleaning.
+
+-   P Suranjana: Section on artificial neural networks.
